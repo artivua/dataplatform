@@ -1,0 +1,347 @@
+---
+- name: Start HDFS and YARN
+  hosts: namenode
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+    hadoop_version: "3.4.0"
+    hadoop_dir: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}"
+  tasks:
+    - name: Start HDFS
+      become_user: hadoop
+      shell: "start-dfs.sh"
+      args:
+        chdir: "{{ hadoop_dir }}"
+
+    - name: Start YARN
+      become_user: hadoop
+      shell: "start-yarn.sh"
+      args:
+        chdir: "{{ hadoop_dir }}"
+
+- name: Install Hive on namenode
+  hosts: namenode
+  become: true
+  vars:
+    hive_version: "4.0.1"
+    hive_archive: "apache-hive-{{ hive_version }}-bin.tar.gz"
+    hive_url: "https://dlcdn.apache.org/hive/hive-{{ hive_version }}/{{ hive_archive }}"
+    hadoop_home: "/home/hadoop"
+    hive_home: "{{ hadoop_home }}/apache-hive-{{ hive_version }}-bin"
+  tasks:
+    - name: Download Hive
+      become_user: hadoop
+      get_url:
+        url: "{{ hive_url }}"
+        dest: "{{ hadoop_home }}/{{ hive_archive }}"
+        mode: '0644'
+
+    - name: Extract Hive
+      become_user: hadoop
+      unarchive:
+        src: "{{ hadoop_home }}/{{ hive_archive }}"
+        dest: "{{ hadoop_home }}/"
+        remote_src: yes
+        creates: "{{ hive_home }}"
+
+    - name: Add Hive environment variables to .bashrc
+      become_user: hadoop
+      lineinfile:
+        path: "{{ hadoop_home }}/.bashrc"
+        line: "{{ item }}"
+      loop:
+        - "export HIVE_HOME={{ hive_home }}"
+        - 'export PATH=$PATH:$HIVE_HOME/bin'
+
+    - name: Source bashrc (to apply Hive env vars)
+      become_user: hadoop
+      shell: "source ~/.bashrc"
+      args:
+        executable: /bin/bash
+
+    - name: Create HDFS directories for Hive
+      become_user: hadoop
+      shell: |
+        hdfs dfs -mkdir /tmp || true
+        hdfs dfs -mkdir -p /user/hive/warehouse || true
+        hdfs dfs -chmod g+w /tmp
+        hdfs dfs -chmod g+w /user/hive/warehouse
+
+- name: Install and configure PostgreSQL for Hive Metastore
+  hosts: namenode
+  become: true
+  vars:
+    hive_db_name: "metastore"
+    hive_db_user: "hive"
+    hive_db_password: "hive"
+  tasks:
+    - name: Install PostgreSQL server and contrib
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL is running
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Configure PostgreSQL to listen on all addresses
+      lineinfile:
+        path: /etc/postgresql/*/main/postgresql.conf
+        regexp: "^#?listen_addresses ="
+        line: "listen_addresses = '*'"
+      notify: Restart PostgreSQL
+
+    - name: Allow access for hive user from cluster nodes in pg_hba.conf
+      lineinfile:
+        path: /etc/postgresql/*/main/pg_hba.conf
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "host    all             hive             192.168.1.23/32         md5"
+        - "host    all             hive             192.168.1.24/32         md5"
+        - "host    all             hive             192.168.1.25/32         md5"
+      notify: Restart PostgreSQL
+
+    - name: Install PostgreSQL client on all nodes (if required)
+      apt:
+        name: postgresql-client
+        state: present
+        update_cache: yes
+
+    - name: Create hive database and user
+      become_user: postgres
+      postgresql_db:
+        name: "{{ hive_db_name }}"
+        state: present
+      register: db_create
+
+    - name: Create hive user
+      become_user: postgres
+      postgresql_user:
+        name: "{{ hive_db_user }}"
+        password: "{{ hive_db_password }}"
+        state: present
+        login: true
+      register: user_create
+
+    - name: Grant privileges to hive user
+      become_user: postgres
+      postgresql_privs:
+        db: "{{ hive_db_name }}"
+        roles: "{{ hive_db_user }}"
+        type: database
+        privs: ALL
+
+    - name: Grant usage and create on schema public
+      become_user: postgres
+      postgresql_privs:
+        db: "{{ hive_db_name }}"
+        schema: public
+        roles: "{{ hive_db_user }}"
+        type: schema
+        privs: "USAGE,CREATE"
+
+- name: Configure Hive Metastore (hive-site.xml, hive-env.sh)
+  hosts: namenode
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+    hive_version: "4.0.1"
+    hive_home: "{{ hadoop_home }}/apache-hive-{{ hive_version }}-bin"
+    hive_pgdriver_url: "https://jdbc.postgresql.org/download/postgresql-42.2.20.jar"
+  tasks:
+    - name: Download PostgreSQL JDBC driver
+      become_user: hadoop
+      get_url:
+        url: "{{ hive_pgdriver_url }}"
+        dest: "{{ hive_home }}/lib/postgresql-42.2.20.jar"
+        mode: '0644'
+
+    - name: Copy hive-site.xml
+      become_user: hadoop
+      copy:
+        dest: "{{ hive_home }}/conf/hive-site.xml"
+        content: |
+          <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>javax.jdo.option.ConnectionURL</name>
+              <value>jdbc:postgresql://192.168.1.23:5432/metastore</value>
+            </property>
+            <property>
+              <name>javax.jdo.option.ConnectionDriverName</name>
+              <value>org.postgresql.Driver</value>
+            </property>
+            <property>
+              <name>javax.jdo.option.ConnectionUserName</name>
+              <value>hive</value>
+            </property>
+            <property>
+              <name>javax.jdo.option.ConnectionPassword</name>
+              <value>hive</value>
+            </property>
+            <property>
+              <name>hive.metastore.try.direct.sql.ddl</name>
+              <value>false</value>
+            </property>
+            <property>
+              <name>hive.metastore.try.direct.sql</name>
+              <value>true</value>
+            </property>
+            <property>
+              <name>datanucleus.schema.autoCreateAll</name>
+              <value>false</value>
+            </property>
+            <property>
+              <name>hive.metastore.schema.verification</name>
+              <value>true</value>
+            </property>
+            <property>
+              <name>hive.metastore.warehouse.dir</name>
+              <value>/user/hive/warehouse</value>
+            </property>
+            <property>
+              <name>hive.server2.logging.operation.enabled</name>
+              <value>true</value>
+            </property>
+            <property>
+              <name>hive.server2.logging.operation.log.location</name>
+              <value>/var/log/hive/operation_logs</value>
+            </property>
+            <property>
+              <name>mapred.reduce.tasks</name>
+              <value>-1</value>
+            </property>
+            <property>
+              <name>hive.exec.reducers.bytes.per.reducer</name>
+              <value>67108864</value>
+            </property>
+            <property>
+              <name>hive.exec.copyfile.maxsize</name>
+              <value>33554432</value>
+            </property>
+            <property>
+              <name>hive.exec.reducers.max</name>
+              <value>1009</value>
+            </property>
+            <property>
+              <name>hive.metastore.execute.setugi</name>
+              <value>true</value>
+            </property>
+            <property>
+              <name>hive.support.concurrency</name>
+              <value>false</value>
+            </property>
+            <property>
+              <name>hive.metastore.server.min.threads</name>
+              <value>200</value>
+            </property>
+            <property>
+              <name>hive.metastore.server.max.threads</name>
+              <value>100000</value>
+            </property>
+            <property>
+              <name>hive.cluster.delegation.token.store.class</name>
+              <value>org.apache.hadoop.hive.thrift.MemoryTokenStore</value>
+            </property>
+            <property>
+              <name>hive.metastore.fshandler.threads</name>
+              <value>15</value>
+            </property>
+            <property>
+              <name>hive.metastore.event.listeners</name>
+              <value></value>
+            </property>
+            <property>
+              <name>hive.metastore.server.max.message.size</name>
+              <value>858993459</value>
+            </property>
+            <property>
+              <name>hive.service.metrics.file.location</name>
+              <value>/var/log/hive/metrics-hivemetastore/metrics.log</value>
+            </property>
+            <property>
+              <name>hive.metastore.metrics.enabled</name>
+              <value>true</value>
+            </property>
+            <property>
+              <name>hive.service.metrics.file.frequency</name>
+              <value>30000</value>
+            </property>
+            <property>
+              <name>hive.server2.thrift.port</name>
+              <value>10000</value>
+            </property>
+            <property>
+              <name>hive.metastore.uris</name>
+              <value>thrift://192.168.1.23:9083</value>
+            </property>
+            <property>
+              <name>hive.server2.thrift.bind.host</name>
+              <value>0.0.0.0</value>
+            </property>
+            <property>
+              <name>hive.server2.authentication</name>
+              <value>NONE</value>
+            </property>
+            <property>
+              <name>hive.aux.jars.path</name>
+              <value>/home/hadoop/apache-hive-4.0.1-bin/lib</value>
+            </property>
+          </configuration>
+
+    - name: Create hive-env.sh from template
+      become_user: hadoop
+      shell: |
+        cp {{ hive_home }}/conf/hive-env.sh.template {{ hive_home }}/conf/hive-env.sh
+        echo "HADOOP_HOME=/home/hadoop/hadoop-3.4.0" >> {{ hive_home }}/conf/hive-env.sh
+        echo "export HIVE_HOME={{ hive_home }}" >> {{ hive_home }}/conf/hive-env.sh
+
+    - name: Create log directories for Hive
+      file:
+        path: /var/log/hive/operation_logs
+        state: directory
+        owner: hadoop
+        group: hadoop
+        mode: '0755'
+
+    - name: Initialize Hive schema
+      become_user: hadoop
+      command: "{{ hive_home }}/bin/schematool -initSchema -dbType postgres"
+      args:
+        chdir: "{{ hive_home }}"
+
+- name: Start Hive Metastore and HiveServer2
+  hosts: namenode
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+    hive_version: "4.0.1"
+    hive_home: "{{ hadoop_home }}/apache-hive-{{ hive_version }}-bin"
+  tasks:
+    - name: Start Hive Metastore
+      become_user: hadoop
+      shell: "nohup hive --service metastore > /tmp/metastore.log 2>&1 &"
+      args:
+        chdir: "{{ hive_home }}"
+
+    - name: Start HiveServer2
+      become_user: hadoop
+      shell: "nohup hive --hiveconf hive.server2.enable.doAs=false --hiveconf hive.security.authorization.enabled=false --service hiveserver2 > /tmp/hs2.log 2>&1 &"
+      args:
+        chdir: "{{ hive_home }}"
+
+- name: Restart PostgreSQL
+  hosts: namenode
+  become: true
+  handlers:
+    - name: Restart PostgreSQL
+      service:
+        name: postgresql
+        state: restarted
