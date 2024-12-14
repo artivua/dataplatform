@@ -1,0 +1,318 @@
+---
+- name: Setup Hadoop User
+  hosts: hadoop_cluster
+  become: true
+  vars:
+    hadoop_password_hash: "$6$rounds=4096$saltstring$BvqtPMZJZBbZ1Y0Z6bNwbhuJ9eZDpJsKM1MNcvWxp3lB3NeQoC3RkMugh8OZGOLKI6rXEIS08QpGYcNI8ktZx/"
+    hadoop_home: "/home/hadoop"
+    hadoop_version: "3.4.0"
+    hadoop_dir: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}"
+    namenode_host: "192.168.1.23"
+    datanode_hosts:
+      - "192.168.1.24"
+      - "192.168.1.25"
+    java_home: "/usr/lib/jvm/java-11-openjdk-amd64"
+    hadoop_archive_url: "https://archive.apache.org/dist/hadoop/common/hadoop-3.4.0/hadoop-3.4.0.tar.gz"
+
+  tasks:
+    - name: Create hadoop user
+      user:
+        name: "hadoop"
+        shell: "/bin/bash"
+        password: "{{ hadoop_password_hash }}"
+        create_home: yes
+
+    - name: Ensure .ssh directory exists
+      file:
+        path: "{{ hadoop_home }}/.ssh"
+        owner: hadoop
+        group: hadoop
+        mode: '0700'
+        state: directory
+
+    - name: Add authorized_keys file (temporary empty)
+      file:
+        path: "{{ hadoop_home }}/.ssh/authorized_keys"
+        owner: hadoop
+        group: hadoop
+        mode: '0600'
+        state: touch
+
+- name: Generate and distribute SSH Keys (only on namenode)
+  hosts: namenode
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+  tasks:
+    - name: Generate SSH key for hadoop user if not present
+      become_user: hadoop
+      openssh_keypair:
+        path: "{{ hadoop_home }}/.ssh/id_rsa"
+        type: rsa
+        size: 2048
+        owner: hadoop
+        group: hadoop
+        mode: '0600'
+      register: ssh_keygen
+
+    - name: Add generated public key to authorized_keys on namenode
+      lineinfile:
+        path: "{{ hadoop_home }}/.ssh/authorized_keys"
+        line: "{{ ssh_keygen.public_key }}"
+        owner: hadoop
+        group: hadoop
+        mode: '0600'
+
+    - name: Copy SSH key to datanodes
+      become_user: hadoop
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['datanodes'] }}"
+      tasks:
+        - name: Install public key on datanodes
+          authorized_key:
+            user: hadoop
+            state: present
+            key: "{{ ssh_keygen.public_key }}"
+
+- name: Install and Configure Hadoop on All Nodes
+  hosts: hadoop_cluster
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+    hadoop_version: "3.4.0"
+    hadoop_dir: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}"
+    hadoop_archive_url: "https://archive.apache.org/dist/hadoop/common/hadoop-3.4.0/hadoop-3.4.0.tar.gz"
+    java_home: "/usr/lib/jvm/java-11-openjdk-amd64"
+    namenode_host: "192.168.1.23"
+    datanode_hosts:
+      - "192.168.1.24"
+      - "192.168.1.25"
+  tasks:
+    - name: Install dependencies (Java)
+      apt:
+        name: openjdk-11-jdk
+        state: present
+        update_cache: yes
+
+    - name: Download Hadoop tarball
+      become_user: hadoop
+      get_url:
+        url: "{{ hadoop_archive_url }}"
+        dest: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Extract Hadoop
+      become_user: hadoop
+      unarchive:
+        src: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}.tar.gz"
+        dest: "{{ hadoop_home }}/"
+        remote_src: yes
+        creates: "{{ hadoop_dir }}"
+
+    - name: Append environment variables to .bashrc
+      become_user: hadoop
+      lineinfile:
+        path: "{{ hadoop_home }}/.bashrc"
+        line: "{{ item }}"
+      loop:
+        - 'export JAVA_HOME={{ java_home }}'
+        - "export HADOOP_HOME={{ hadoop_dir }}"
+        - "export HADOOP_INSTALL={{ hadoop_dir }}"
+        - "export HADOOP_COMMON_HOME={{ hadoop_dir }}"
+        - "export HADOOP_HDFS_HOME={{ hadoop_dir }}"
+        - "export HADOOP_CONF_DIR={{ hadoop_dir }}/etc/hadoop"
+        - "export PATH=$PATH:{{ hadoop_dir }}/sbin:{{ hadoop_dir }}/bin"
+
+    - name: Set JAVA_HOME in hadoop-env.sh
+      become_user: hadoop
+      lineinfile:
+        path: "{{ hadoop_dir }}/etc/hadoop/hadoop-env.sh"
+        regexp: '^export JAVA_HOME='
+        line: "export JAVA_HOME={{ java_home }}"
+        insertafter: EOF
+
+    - name: Configure core-site.xml
+      become_user: hadoop
+      copy:
+        dest: "{{ hadoop_dir }}/etc/hadoop/core-site.xml"
+        content: |
+          <?xml version="1.0"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>fs.defaultFS</name>
+              <value>hdfs://{{ namenode_host }}:9000</value>
+            </property>
+          </configuration>
+
+    - name: Configure hdfs-site.xml on namenode
+      when: inventory_hostname == namenode_host
+      become_user: hadoop
+      copy:
+        dest: "{{ hadoop_dir }}/etc/hadoop/hdfs-site.xml"
+        content: |
+          <?xml version="1.0"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>dfs.replication</name>
+              <value>3</value>
+            </property>
+            <property>
+              <name>dfs.namenode.name.dir</name>
+              <value>file://{{ hadoop_dir }}/hdfs/namenode</value>
+            </property>
+            <property>
+              <name>dfs.datanode.data.dir</name>
+              <value>file://{{ hadoop_dir }}/hdfs/datanode</value>
+            </property>
+          </configuration>
+
+    - name: Configure hdfs-site.xml on datanodes
+      when: inventory_hostname in datanode_hosts
+      become_user: hadoop
+      copy:
+        dest: "{{ hadoop_dir }}/etc/hadoop/hdfs-site.xml"
+        content: |
+          <?xml version="1.0"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>dfs.replication</name>
+              <value>3</value>
+            </property>
+            <property>
+              <name>dfs.datanode.data.dir</name>
+              <value>file://{{ hadoop_dir }}/hdfs/datanode</value>
+            </property>
+          </configuration>
+
+    - name: Configure workers file (on all nodes)
+      become_user: hadoop
+      copy:
+        dest: "{{ hadoop_dir }}/etc/hadoop/workers"
+        content: |
+          {% for host in datanode_hosts %}
+          {{ host }}
+          {% endfor %}
+
+    - name: Create namenode directory (namenode only)
+      when: inventory_hostname == namenode_host
+      become_user: hadoop
+      file:
+        path: "{{ hadoop_dir }}/hdfs/namenode"
+        state: directory
+
+    - name: Create datanode directory (all nodes)
+      become_user: hadoop
+      file:
+        path: "{{ hadoop_dir }}/hdfs/datanode"
+        state: directory
+
+
+- name: Format NameNode
+  hosts: namenode
+  become: true
+  tasks:
+    - name: Format namenode
+      become_user: hadoop
+      command: "{{ hadoop_dir }}/bin/hdfs namenode -format"
+      args:
+        chdir: "{{ hadoop_home }}"
+
+- name: Start HDFS Services
+  hosts: namenode
+  become: true
+  tasks:
+    - name: Start DFS
+      become_user: hadoop
+      shell: "start-dfs.sh"
+      args:
+        executable: /bin/bash
+
+- name: Stop HDFS Services
+  hosts: namenode
+  become: true
+  tasks:
+    - name: Stop DFS
+      become_user: hadoop
+      shell: "stop-dfs.sh"
+      args:
+        executable: /bin/bash
+
+- name: Setup Authentication and Proxy on jump-node
+  hosts: jumpnode
+  become: true
+  vars:
+    nginx_conf_dir: "/etc/nginx/sites-available"
+    namenode_ui_port: 9870
+    sn_ui_port: 9868
+  tasks:
+    - name: Install apache2-utils for htpasswd
+      apt:
+        name: apache2-utils
+        state: present
+        update_cache: yes
+
+    - name: Create htpasswd file
+      command: "htpasswd -bc /etc/nginx/.htpasswd hadoop h@DooP$"
+      args:
+        creates: "/etc/nginx/.htpasswd"
+
+    - name: Set correct permissions on htpasswd file
+      file:
+        path: "/etc/nginx/.htpasswd"
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: Create nginx config for NameNode UI
+      copy:
+        dest: "{{ nginx_conf_dir }}/nn"
+        content: |
+          server {
+              listen {{ namenode_ui_port }} default_server;
+              root /var/www/html;
+              index index.html index.htm index.nginx-debian.html;
+              server_name _;
+
+              location / {
+                  proxy_pass http://team-5-nn:{{ namenode_ui_port }};
+                  auth_basic "Restricted Access";
+                  auth_basic_user_file /etc/nginx/.htpasswd;
+              }
+          }
+
+    - name: Symlink nn config to sites-enabled
+      file:
+        src: "{{ nginx_conf_dir }}/nn"
+        dest: "/etc/nginx/sites-enabled/nn"
+        state: link
+
+    - name: Create config for Secondary NameNode UI
+      copy:
+        dest: "{{ nginx_conf_dir }}/sn"
+        content: |
+          server {
+              listen {{ sn_ui_port }} default_server;
+              root /var/www/html;
+              index index.html index.htm index.nginx-debian.html;
+              server_name _;
+
+              location / {
+                  proxy_pass http://team-5-nn:{{ sn_ui_port }};
+                  auth_basic "Restricted Access";
+                  auth_basic_user_file /etc/nginx/.htpasswd;
+              }
+          }
+
+    - name: Symlink sn config to sites-enabled
+      file:
+        src: "{{ nginx_conf_dir }}/sn"
+        dest: "/etc/nginx/sites-enabled/sn"
+        state: link
+
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
