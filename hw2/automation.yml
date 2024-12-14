@@ -1,0 +1,137 @@
+---
+- name: Update /etc/hosts for all nodes
+  hosts: all
+  become: true
+  vars:
+    hosts_entries:
+      - "192.168.1.22 team-5-jn"
+      - "192.168.1.23 team-5-nn"
+      - "192.168.1.24 team-5-dn-0"
+      - "192.168.1.25 team-5-dn-1"
+  tasks:
+    - name: Add hosts entries
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      loop: "{{ hosts_entries }}"
+      notify: Restart networking if needed
+
+- name: Configure YARN and MapReduce on all Yarn nodes
+  hosts: hadoop_cluster
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+    hadoop_version: "3.4.0"
+    hadoop_dir: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}"
+    namenode_host: "team-5-nn"
+  tasks:
+    - name: Configure mapred-site.xml
+      become_user: hadoop
+      copy:
+        dest: "{{ hadoop_dir }}/etc/hadoop/mapred-site.xml"
+        content: |
+          <?xml version="1.0"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>mapreduce.framework.name</name>
+              <value>yarn</value>
+            </property>
+            <property>
+              <name>mapreduce.application.classpath</name>
+              <value>$HADOOP_HOME/share/hadoop/mapreduce/*:$HADOOP_HOME/share/hadoop/mapreduce/lib/*</value>
+            </property>
+          </configuration>
+
+    - name: Configure yarn-site.xml
+      become_user: hadoop
+      copy:
+        dest: "{{ hadoop_dir }}/etc/hadoop/yarn-site.xml"
+        content: |
+          <?xml version="1.0"?>
+          <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+          <configuration>
+            <property>
+              <name>yarn.nodemanager.aux-services</name>
+              <value>mapreduce_shuffle</value>
+            </property>
+            <property>
+              <name>yarn.nodemanager.env-whitelist</name>
+              <value>JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_HOME,PATH,LANG,TZ,HADOOP_MAPRED_HOME</value>
+            </property>
+          </configuration>
+
+- name: Start YARN services (ResourceManager, NodeManager)
+  hosts: namenode
+  become: true
+  vars:
+    hadoop_home: "/home/hadoop"
+    hadoop_version: "3.4.0"
+    hadoop_dir: "{{ hadoop_home }}/hadoop-{{ hadoop_version }}"
+  tasks:
+    - name: Start YARN
+      become_user: hadoop
+      command: "{{ hadoop_dir }}/sbin/start-yarn.sh"
+
+    - name: Start History Server
+      become_user: hadoop
+      command: "{{ hadoop_dir }}/bin/mapred --daemon start historyserver"
+
+- name: Configure Nginx for YARN and HistoryServer
+  hosts: jumpnode
+  become: true
+  vars:
+    yarn_port: 8088
+    history_server_port: 19888
+  tasks:
+    - name: Create nginx config for YARN
+      copy:
+        dest: /etc/nginx/sites-available/yarn
+        content: |
+          server {
+              listen {{ yarn_port }} default_server;
+              root /var/www/html;
+              index index.html index.htm index.nginx-debian.html;
+              server_name _;
+
+              location / {
+                  proxy_pass http://team-5-nn:{{ yarn_port }};
+                  auth_basic "Restricted Access";
+                  auth_basic_user_file /etc/nginx/.htpasswd;
+              }
+          }
+
+    - name: Enable YARN config
+      file:
+        src: /etc/nginx/sites-available/yarn
+        dest: /etc/nginx/sites-enabled/yarn
+        state: link
+
+    - name: Create nginx config for History Server
+      copy:
+        dest: /etc/nginx/sites-available/history
+        content: |
+          server {
+              listen {{ history_server_port }} default_server;
+              root /var/www/html;
+              index index.html index.htm index.nginx-debian.html;
+              server_name _;
+
+              location / {
+                  proxy_pass http://team-5-nn:{{ history_server_port }};
+                  auth_basic "Restricted Access";
+                  auth_basic_user_file /etc/nginx/.htpasswd;
+              }
+          }
+
+    - name: Enable History Server config
+      file:
+        src: /etc/nginx/sites-available/history
+        dest: /etc/nginx/sites-enabled/history
+        state: link
+
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
